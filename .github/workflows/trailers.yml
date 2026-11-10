@@ -33,33 +33,60 @@ jobs:
           from datetime import datetime, timezone
           from xml.sax.saxutils import escape
 
-          COUNTRY = "us"      # chart country
-          LIMIT = 100         # how many top shows to check
-          MAX_ITEMS = 300     # trailers kept in the feed
-          UA = {"User-Agent": "Mozilla/5.0 (personal trailer feed)"}
+          COUNTRIES = ["us", "gb", "ca", "au", "ie"]   # Apple top charts to check
+          LIMIT = 100          # top shows per country
+          # Feeds where every episode is a trailer (Podnews: new & noteworthy launches)
+          ALL_TRAILER_FEEDS = ["https://podnews.net/sitemap/trailers.xml"]
+          MAX_ITEMS = 400      # trailers kept in the feed
+          UA = "PersonalTrailerFeed/1.0"
           IT = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
 
-          def get(url):
-              req = urllib.request.Request(url, headers=UA)
-              with urllib.request.urlopen(req, timeout=25) as r:
+          def get(url, headers=None):
+              h = {"User-Agent": UA}
+              h.update(headers or {})
+              with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=25) as r:
                   return r.read()
 
-          def chart_ids():
+          # ---- Apple charts ----
+          def chart_ids(cc):
               try:
-                  d = json.loads(get(f"https://rss.applemarketingtools.com/api/v2/{COUNTRY}/podcasts/top/{LIMIT}/podcasts.json"))
+                  d = json.loads(get(f"https://rss.applemarketingtools.com/api/v2/{cc}/podcasts/top/{LIMIT}/podcasts.json"))
                   return [x["id"] for x in d["feed"]["results"]]
               except Exception as e:
-                  print("Main chart failed, trying backup:", e)
-                  d = json.loads(get(f"https://itunes.apple.com/{COUNTRY}/rss/toppodcasts/limit={LIMIT}/json"))
-                  return [x["id"]["attributes"]["im:id"] for x in d["feed"]["entry"]]
+                  print(cc, "main chart failed, trying backup:", e)
+                  try:
+                      d = json.loads(get(f"https://itunes.apple.com/{cc}/rss/toppodcasts/limit={LIMIT}/json"))
+                      return [x["id"]["attributes"]["im:id"] for x in d["feed"]["entry"]]
+                  except Exception as e2:
+                      print(cc, "chart skipped:", e2)
+                      return []
 
-          def feed_urls(ids):
+          def apple_feeds(cc, ids):
               out = []
               for i in range(0, len(ids), 50):
-                  d = json.loads(get("https://itunes.apple.com/lookup?id=" + ",".join(ids[i:i+50])))
-                  out += [(r.get("collectionName", ""), r["feedUrl"]) for r in d["results"] if r.get("feedUrl")]
+                  try:
+                      d = json.loads(get(f"https://itunes.apple.com/lookup?country={cc}&id=" + ",".join(ids[i:i+50])))
+                      out += [(r.get("collectionName", ""), r["feedUrl"]) for r in d["results"] if r.get("feedUrl")]
+                  except Exception as e:
+                      print(cc, "lookup failed:", e)
               return out
 
+          shows = []
+          for cc in COUNTRIES:
+              s = apple_feeds(cc, chart_ids(cc))
+              print(cc.upper(), len(s), "shows")
+              shows += s
+          shows += [("Podnews", u) for u in ALL_TRAILER_FEEDS]
+
+          uniq, seen_feeds = [], set()
+          for name, url in shows:
+              k = url.strip().lower().rstrip("/")
+              if k not in seen_feeds:
+                  seen_feeds.add(k)
+                  uniq.append((name, url))
+          print(len(uniq), "unique shows to check")
+
+          # ---- Pull trailers from each show ----
           def trailers(show):
               name, url = show
               found = []
@@ -71,8 +98,9 @@ jobs:
               if ch is None:
                   return found
               title = (ch.findtext("title") or name).strip()
+              everything = url in ALL_TRAILER_FEEDS
               for it in ch.findall("item"):
-                  if (it.findtext(IT + "episodeType") or "").strip().lower() != "trailer":
+                  if not everything and (it.findtext(IT + "episodeType") or "").strip().lower() != "trailer":
                       continue
                   enc = it.find("enclosure")
                   if enc is None or not enc.get("url"):
@@ -84,23 +112,22 @@ jobs:
                   date = date or datetime(2000, 1, 1, tzinfo=timezone.utc)
                   if date.tzinfo is None:
                       date = date.replace(tzinfo=timezone.utc)
+                  ep = (it.findtext("title") or "Trailer").strip()
                   found.append({
-                      "show": title,
-                      "title": (it.findtext("title") or "Trailer").strip(),
+                      "show": ep if everything else title,
+                      "title": "New show trailer" if everything else ep,
                       "url": enc.get("url"),
                       "type": enc.get("type") or "audio/mpeg",
                       "length": enc.get("length") or "0",
                       "date": date,
                       "guid": (it.findtext("guid") or enc.get("url")).strip(),
-                      "link": (ch.findtext("link") or "").strip(),
+                      "link": ((it.findtext("link") if everything else None) or ch.findtext("link") or "").strip(),
                   })
               return found
 
-          shows = feed_urls(chart_ids())
-          print(len(shows), "shows checked")
           items = []
-          with cf.ThreadPoolExecutor(16) as ex:
-              for r in ex.map(trailers, shows):
+          with cf.ThreadPoolExecutor(24) as ex:
+              for r in ex.map(trailers, uniq):
                   items += r
 
           seen, keep = set(), []
@@ -131,7 +158,7 @@ jobs:
           <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
           <channel>
             <title>Trailer Feed</title>
-            <description>Trailers from Apple's top {LIMIT} {COUNTRY.upper()} podcasts, refreshed daily.</description>
+            <description>Trailers from top podcasts in the US, UK, Canada, Australia and Ireland, plus new launches via Podnews. Refreshed daily.</description>
             <link>https://podcasts.apple.com</link>
             <language>en</language>
             <lastBuildDate>{now}</lastBuildDate>
