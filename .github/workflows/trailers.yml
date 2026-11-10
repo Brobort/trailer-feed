@@ -26,6 +26,7 @@ jobs:
       - name: Build trailer feed
         run: |
           mkdir -p site
+          cp cover.jpg site/ 2>/dev/null || true
           python3 - <<'EOF'
           import json, sys, urllib.request, concurrent.futures as cf
           import xml.etree.ElementTree as ET
@@ -163,6 +164,8 @@ jobs:
             <language>en</language>
             <lastBuildDate>{now}</lastBuildDate>
             <itunes:block>Yes</itunes:block>
+            <itunes:image href="https://brobort.github.io/trailer-feed/cover.jpg"/>
+            <image><url>https://brobort.github.io/trailer-feed/cover.jpg</url><title>Trailer Feed</title><link>https://podcasts.apple.com</link></image>
           {''.join(rows)}
           </channel>
           </rss>"""
