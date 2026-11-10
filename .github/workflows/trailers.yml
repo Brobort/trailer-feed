@@ -1,0 +1,161 @@
+name: Trailer feed
+
+on:
+  schedule:
+    - cron: "17 22 * * *"   # daily, 6:17am Shanghai time
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build trailer feed
+        run: |
+          mkdir -p site
+          python3 - <<'EOF'
+          import json, sys, urllib.request, concurrent.futures as cf
+          import xml.etree.ElementTree as ET
+          from email.utils import parsedate_to_datetime, format_datetime
+          from datetime import datetime, timezone
+          from xml.sax.saxutils import escape
+
+          COUNTRY = "us"      # chart country
+          LIMIT = 100         # how many top shows to check
+          MAX_ITEMS = 300     # trailers kept in the feed
+          UA = {"User-Agent": "Mozilla/5.0 (personal trailer feed)"}
+          IT = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
+
+          def get(url):
+              req = urllib.request.Request(url, headers=UA)
+              with urllib.request.urlopen(req, timeout=25) as r:
+                  return r.read()
+
+          def chart_ids():
+              try:
+                  d = json.loads(get(f"https://rss.applemarketingtools.com/api/v2/{COUNTRY}/podcasts/top/{LIMIT}/podcasts.json"))
+                  return [x["id"] for x in d["feed"]["results"]]
+              except Exception as e:
+                  print("Main chart failed, trying backup:", e)
+                  d = json.loads(get(f"https://itunes.apple.com/{COUNTRY}/rss/toppodcasts/limit={LIMIT}/json"))
+                  return [x["id"]["attributes"]["im:id"] for x in d["feed"]["entry"]]
+
+          def feed_urls(ids):
+              out = []
+              for i in range(0, len(ids), 50):
+                  d = json.loads(get("https://itunes.apple.com/lookup?id=" + ",".join(ids[i:i+50])))
+                  out += [(r.get("collectionName", ""), r["feedUrl"]) for r in d["results"] if r.get("feedUrl")]
+              return out
+
+          def trailers(show):
+              name, url = show
+              found = []
+              try:
+                  ch = ET.fromstring(get(url)).find("channel")
+              except Exception as e:
+                  print("Skipped", name, "-", e)
+                  return found
+              if ch is None:
+                  return found
+              title = (ch.findtext("title") or name).strip()
+              for it in ch.findall("item"):
+                  if (it.findtext(IT + "episodeType") or "").strip().lower() != "trailer":
+                      continue
+                  enc = it.find("enclosure")
+                  if enc is None or not enc.get("url"):
+                      continue
+                  try:
+                      date = parsedate_to_datetime(it.findtext("pubDate"))
+                  except Exception:
+                      date = None
+                  date = date or datetime(2000, 1, 1, tzinfo=timezone.utc)
+                  if date.tzinfo is None:
+                      date = date.replace(tzinfo=timezone.utc)
+                  found.append({
+                      "show": title,
+                      "title": (it.findtext("title") or "Trailer").strip(),
+                      "url": enc.get("url"),
+                      "type": enc.get("type") or "audio/mpeg",
+                      "length": enc.get("length") or "0",
+                      "date": date,
+                      "guid": (it.findtext("guid") or enc.get("url")).strip(),
+                      "link": (ch.findtext("link") or "").strip(),
+                  })
+              return found
+
+          shows = feed_urls(chart_ids())
+          print(len(shows), "shows checked")
+          items = []
+          with cf.ThreadPoolExecutor(16) as ex:
+              for r in ex.map(trailers, shows):
+                  items += r
+
+          seen, keep = set(), []
+          for x in sorted(items, key=lambda x: x["date"], reverse=True):
+              if x["url"] not in seen:
+                  seen.add(x["url"])
+                  keep.append(x)
+          keep = keep[:MAX_ITEMS]
+          print(len(keep), "trailers in feed")
+          if not keep:
+              sys.exit("No trailers found; keeping yesterday's feed.")
+
+          a = lambda s: escape(s, {'"': "&quot;"})
+          rows = []
+          for x in keep:
+              rows.append(f"""<item>
+            <title>{escape(x['show'] + ': ' + x['title'])}</title>
+            <description>{escape('Trailer for ' + x['show'])}</description>
+            <link>{escape(x['link'])}</link>
+            <guid isPermaLink="false">{escape(x['guid'])}</guid>
+            <pubDate>{format_datetime(x['date'])}</pubDate>
+            <enclosure url="{a(x['url'])}" type="{a(x['type'])}" length="{a(x['length'])}"/>
+            <itunes:episodeType>full</itunes:episodeType>
+          </item>""")
+
+          now = format_datetime(datetime.now(timezone.utc))
+          rss = f"""<?xml version="1.0" encoding="UTF-8"?>
+          <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+          <channel>
+            <title>Trailer Feed</title>
+            <description>Trailers from Apple's top {LIMIT} {COUNTRY.upper()} podcasts, refreshed daily.</description>
+            <link>https://podcasts.apple.com</link>
+            <language>en</language>
+            <lastBuildDate>{now}</lastBuildDate>
+            <itunes:block>Yes</itunes:block>
+          {''.join(rows)}
+          </channel>
+          </rss>"""
+          open("site/feed.xml", "w", encoding="utf-8").write(rss)
+          EOF
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      # GitHub pauses schedules on quiet repos after 60 days; a monthly commit prevents that.
+      - name: Keep schedule alive
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date +%d)" = "01" ]; then
+            date > keepalive.txt
+            git config user.name "trailer-bot"
+            git config user.email "trailer-bot@users.noreply.github.com"
+            git add keepalive.txt && git commit -m "keepalive" && git push
+          fi
